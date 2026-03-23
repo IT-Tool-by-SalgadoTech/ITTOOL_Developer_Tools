@@ -1,0 +1,7 @@
+DELAY 1000
+STRNING cd $HOME\Desktop\ITTOOL_TOOLS
+ENTER
+DELAY 2000
+STRING python .\numbering.py
+ENTER
+
