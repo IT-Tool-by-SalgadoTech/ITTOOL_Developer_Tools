@@ -424,6 +424,119 @@ def create_missing(fl, plan):
     return created
 
 # ---------------------------------------------------------------------
+# ORDER BY SCRIPT NUMBER
+#   After renumbering, lay every entry out in ascending script-number
+#   order (1, 2, 3, ...), grouped under its section heading. file_list
+#   numbers are the source of truth. Existing headings are reused; a
+#   section heading is created only when the manual has entries for a
+#   folder but no heading for it (so the numeric list stays labeled).
+#   Replaces the neighbour-anchored placement of create_missing.
+# ---------------------------------------------------------------------
+WP_TAG = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
+
+def _folder_segments(path):
+    return tuple(path.replace("\\", "/").split("/")[:-1])
+
+def _clone_heading(donor_p, text):
+    new_p = copy.deepcopy(donor_p)
+    for attr in (W14 + "paraId", W14 + "textId"):
+        if new_p.get(attr) is not None:
+            del new_p.attrib[attr]
+    np = Paragraph(new_p, None)
+    for r in list(np.runs):
+        r._r.getparent().remove(r._r)
+    np.add_run(text)
+    return new_p
+
+def reorder_by_number(doc, fl, plan):
+    present = plan["present"]
+    body = doc.element.body
+
+    # entries in ascending SCRIPT-NUMBER order (this is the whole point)
+    seq = sorted(fl["order"], key=lambda e: (e["number"], e["path"]))
+
+    headings = []
+    for p in doc.paragraphs:
+        if is_heading_style(p):
+            m = re.search(r"(\d+)", p.style.name or "")
+            headings.append([int(m.group(1)) if m else 5, para_text(p).strip(), p, False])
+    if not headings:                          # no structure -> classic behavior
+        return create_missing(fl, plan)
+
+    # every folder (and its ancestors) the manual needs
+    needed, seen = [], set()
+    for e in seq:
+        ft = _folder_segments(e["path"])
+        for k in range(1, len(ft) + 1):
+            if ft[:k] not in seen:
+                seen.add(ft[:k]); needed.append(ft[:k])
+
+    # assign each folder a heading: reuse by name, else mark to synthesize
+    assign = {}
+    for sub in needed:
+        name = sub[-1]; best, bi = -1.0, None
+        for i, h in enumerate(headings):
+            if h[3]:
+                continue
+            s = folder_similarity(name, h[1])
+            if s > best:
+                best, bi = s, i
+        if bi is not None and best >= 0.55:
+            headings[bi][3] = True
+            assign[sub] = ("reuse", headings[bi][2]._p)
+        else:
+            assign[sub] = ("new", name)
+
+    donor = max(headings, key=lambda h: h[0])[2]._p
+    generic_tmpl = None
+    folder_tmpl = {}
+    for e in seq:
+        if e["path"] in present:
+            if generic_tmpl is None:
+                generic_tmpl = present[e["path"]]
+            folder_tmpl.setdefault(_folder_segments(e["path"]), present[e["path"]])
+
+    target, emitted, created = [], set(), 0
+
+    def ensure_heading(ft):
+        for k in range(1, len(ft) + 1):
+            sub = ft[:k]
+            if sub in emitted:
+                continue
+            emitted.add(sub)
+            kind, payload = assign[sub]
+            target.append(payload if kind == "reuse" else _clone_heading(donor, payload))
+
+    for e in seq:
+        ft = _folder_segments(e["path"])
+        ensure_heading(ft)
+        if e["path"] in present:
+            p = present[e["path"]]
+            set_entry_number(p, e["number"])
+            target.append(p._p)
+        else:
+            tmpl = folder_tmpl.get(ft) or generic_tmpl
+            if tmpl is None:
+                continue
+            stub = make_stub(tmpl, e["number"], e["title"], tmpl, "after")
+            target.append(stub._p); created += 1
+
+    # re-anchor the whole ordered sequence right after the intro
+    children = list(body.iterchildren())
+    first_idx = children.index(headings[0][2]._p)
+    anchor = children[first_idx - 1]
+    target_ids = set(id(el) for el in target)
+    for el in target:
+        anchor.addnext(el); anchor = el
+
+    # keep any leftover paragraph (unmatched entries, duplicates) at the end
+    for el in [c for c in children[first_idx:]
+               if c.tag == WP_TAG and id(c) not in target_ids]:
+        anchor.addnext(el); anchor = el
+
+    return created
+
+# ---------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------
 def report(plan, fl, missing):
@@ -481,7 +594,7 @@ def apply_changes(doc, plan, fl, docx_path):
             n += 1
         else:
             cprint(C.R, f"   [skip] could not locate number run for: {r['name']}")
-    created = create_missing(fl, plan)
+    created = reorder_by_number(doc, fl, plan)
     base, ext = os.path.splitext(docx_path)
     out = base + "_renumbered" + ext
     doc.save(out)
